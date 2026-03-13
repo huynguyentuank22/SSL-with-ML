@@ -76,7 +76,46 @@ def make_loader(X: np.ndarray, batch_size: int, shuffle: bool = True) -> DataLoa
     ds = TensorDataset(to_tensor(X))
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
+def make_loader_from_tensor(X: torch.Tensor, batch_size: int, shuffle: bool = True) -> DataLoader:
+    ds = TensorDataset(X)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
+def split_ssl_train_val(
+    X: np.ndarray,
+    val_fraction: float,
+    seed: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if val_fraction <= 0.0 or len(X) < 10:
+        return X, None
+    n_val = max(1, int(len(X) * val_fraction))
+    if n_val >= len(X):
+        return X, None
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(X))
+    val_idx = idx[:n_val]
+    train_idx = idx[n_val:]
+    if len(train_idx) == 0:
+        return X, None
+    return X[train_idx], X[val_idx]
+
+class EarlyStopper:
+    def __init__(self, patience: Optional[int], min_delta: float = 0.0):
+        self.patience = patience if patience is not None and patience > 0 else None
+        self.min_delta = float(min_delta)
+        self.best_loss = float("inf")
+        self.best_state = None
+        self.bad_epochs = 0
+
+    def update(self, loss: float, state_fn) -> bool:
+        if self.patience is None:
+            return False
+        if loss < self.best_loss - self.min_delta:
+            self.best_loss = float(loss)
+            self.best_state = state_fn()
+            self.bad_epochs = 0
+            return False
+        self.bad_epochs += 1
+        return self.bad_epochs >= self.patience
 # ===========================================================================
 # Base class
 # ===========================================================================
@@ -194,10 +233,16 @@ class DAEModel(BaseSSLModel):
         batch_size: int = 256,
         lr: float = 1e-3,
         seed: int = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, epochs=epochs,
-                      batch_size=batch_size, lr=lr, **arch)
+                      batch_size=batch_size, lr=lr,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -233,10 +278,17 @@ class DAEModel(BaseSSLModel):
 
     def fit_ssl(self, X_train: np.ndarray) -> None:
         set_seed(self.seed)
-        loader = make_loader(X_train, self.config["batch_size"])
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        loader = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params = list(self.encoder.parameters()) + list(self.decoder.parameters())
         optim  = torch.optim.Adam(params, lr=self.config["lr"])
         mse    = nn.MSELoss()
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[DAE-{self.arch_name}] Pretraining {self.config['epochs']} epochs ...")
         for epoch in range(1, self.config["epochs"] + 1):
@@ -250,9 +302,33 @@ class DAEModel(BaseSSLModel):
                 loss    = mse(x_hat, x)
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.decoder.eval()
+        mse = nn.MSELoss()
+        total = 0.0
+        n_batches = 0
+        for (x,) in loader:
+            x = x.to(self.device)
+            x_tilde = self._corrupt(x)
+            x_hat = self.decoder(self.encoder(x_tilde))
+            total += mse(x_hat, x).item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = len(self.encoder.layers)
@@ -354,10 +430,16 @@ class VIMEModel(BaseSSLModel):
         batch_size: int = 256,
         lr: float      = 1e-3,
         seed: int      = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, p_mask=p_mask, alpha=alpha,
-                      epochs=epochs, batch_size=batch_size, lr=lr, **arch)
+                      epochs=epochs, batch_size=batch_size, lr=lr,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -394,12 +476,15 @@ class VIMEModel(BaseSSLModel):
     def fit_ssl(self, X_train: np.ndarray) -> None:
         set_seed(self.seed)
 
-        N   = len(X_train)
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        N   = len(X_fit)
         ref = min(50_000, N)
         idx = np.random.choice(N, ref, replace=False)
-        self._X_ref = torch.tensor(X_train[idx], dtype=torch.float32)
+        self._X_ref = torch.tensor(X_fit[idx], dtype=torch.float32)
 
-        loader = make_loader(X_train, self.config["batch_size"])
+        loader = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params = (list(self.encoder.parameters()) +
                   list(self.mask_head.parameters()) +
                   list(self.value_head.parameters()))
@@ -407,6 +492,10 @@ class VIMEModel(BaseSSLModel):
         bce    = nn.BCELoss()
         mse    = nn.MSELoss()
         alpha  = self.config["alpha"]
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[VIME-{self.arch_name}] Pretraining {self.config['epochs']} epochs ...")
         for epoch in range(1, self.config["epochs"] + 1):
@@ -427,9 +516,39 @@ class VIMEModel(BaseSSLModel):
 
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.mask_head.eval(); self.value_head.eval()
+        bce = nn.BCELoss()
+        mse = nn.MSELoss()
+        total = 0.0
+        n_batches = 0
+        for (x,) in loader:
+            x = x.to(self.device)
+            x_tilde, m = self._corrupt(x)
+            z = self.encoder(x_tilde)
+            m_hat = self.mask_head(z)
+            x_hat = self.value_head(z)
+            loss_m = bce(m_hat, m)
+            loss_v = (mse(x_hat * m, x * m)
+                      if m.sum() > 0 else x_hat.new_zeros(1).mean())
+            total += (loss_m + self.config["alpha"] * loss_v).item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = len(self.encoder.layers)
@@ -534,11 +653,17 @@ class SCARFModel(BaseSSLModel):
         batch_size: int        = 256,
         lr: float              = 1e-3,
         seed: int              = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, corruption_rate=corruption_rate,
                       temperature=temperature, epochs=epochs,
-                      batch_size=batch_size, lr=lr, **arch)
+                      batch_size=batch_size, lr=lr,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -578,15 +703,22 @@ class SCARFModel(BaseSSLModel):
 
     def fit_ssl(self, X_train: np.ndarray) -> None:
         set_seed(self.seed)
-        N   = len(X_train)
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        N   = len(X_fit)
         ref = min(50_000, N)
         self._X_ref = torch.tensor(
-            X_train[np.random.choice(N, ref, replace=False)], dtype=torch.float32
+            X_fit[np.random.choice(N, ref, replace=False)], dtype=torch.float32
         )
 
-        loader = make_loader(X_train, self.config["batch_size"])
+        loader = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params = list(self.encoder.parameters()) + list(self.proj_head.parameters())
         optim  = torch.optim.Adam(params, lr=self.config["lr"])
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[SCARF-{self.arch_name}] Pretraining {self.config['epochs']} epochs ...")
         for epoch in range(1, self.config["epochs"] + 1):
@@ -600,9 +732,33 @@ class SCARFModel(BaseSSLModel):
                 loss = self._nt_xent(z1, z2)
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.proj_head.eval()
+        total = 0.0
+        n_batches = 0
+        for (x,) in loader:
+            x = x.to(self.device)
+            x_tilde = self._corrupt(x)
+            z1 = self.proj_head(self.encoder(x))
+            z2 = self.proj_head(self.encoder(x_tilde))
+            total += self._nt_xent(z1, z2).item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = len(self.encoder.blocks)
@@ -796,12 +952,18 @@ class SAINTModel(BaseSSLModel):
         batch_size: int          = 64,
         lr: float                = 1e-3,
         seed: int                = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, feat_corrupt_rate=feat_corrupt_rate,
                       noise_std=noise_std, temperature=temperature,
                       lambda_recon=lambda_recon, epochs=epochs,
-                      batch_size=batch_size, lr=lr, **arch)
+                      batch_size=batch_size, lr=lr,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -842,13 +1004,20 @@ class SAINTModel(BaseSSLModel):
 
     def fit_ssl(self, X_train: np.ndarray) -> None:
         set_seed(self.seed)
-        loader = make_loader(X_train, self.config["batch_size"])
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        loader = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params = (list(self.encoder.parameters()) +
                   list(self.proj_head.parameters()) +
                   list(self.recon_head.parameters()))
         optim  = torch.optim.Adam(params, lr=self.config["lr"])
         mse    = nn.MSELoss()
         lam    = self.config["lambda_recon"]
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[SAINT-{self.arch_name}] Pretraining {self.config['epochs']} epochs "
                  f"(batch={self.config['batch_size']}, row-attn=ON) ...")
@@ -868,9 +1037,36 @@ class SAINTModel(BaseSSLModel):
 
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.proj_head.eval(); self.recon_head.eval()
+        mse = nn.MSELoss()
+        total = 0.0
+        n_batches = 0
+        for (x,) in loader:
+            x = x.to(self.device)
+            x_cor = self._corrupt(x)
+            z_cl = self.encoder(x)
+            z_co = self.encoder(x_cor)
+            loss = self._nt_xent(self.proj_head(z_cl), self.proj_head(z_co))
+            loss = loss + self.config["lambda_recon"] * mse(self.recon_head(z_co), x)
+            total += loss.item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = self.config["n_layers"]
@@ -983,10 +1179,16 @@ class SubTabModel(BaseSSLModel):
         temperature: float = 0.07,
         lambda_rec: float  = 1.0,
         seed: int          = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, epochs=epochs, batch_size=batch_size,
-                      lr=lr, temperature=temperature, lambda_rec=lambda_rec, **arch)
+                      lr=lr, temperature=temperature, lambda_rec=lambda_rec,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -1043,7 +1245,10 @@ class SubTabModel(BaseSSLModel):
 
     def fit_ssl(self, X_train: np.ndarray) -> None:
         set_seed(self.seed)
-        loader  = make_loader(X_train, self.config["batch_size"])
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        loader  = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params  = (list(self.encoder.parameters()) +
                    list(self.proj_head.parameters()) +
                    list(self.recon_head.parameters()))
@@ -1051,6 +1256,10 @@ class SubTabModel(BaseSSLModel):
         mse     = nn.MSELoss()
         K       = len(self.subsets)
         lam     = self.config["lambda_rec"]
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[SubTab-{self.arch_name}] Pretraining {self.config['epochs']} epochs "
                  f"({K} subsets, max_sub={self.max_sub}) ...")
@@ -1079,9 +1288,46 @@ class SubTabModel(BaseSSLModel):
                 loss = loss_ctr + lam * loss_rec
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.proj_head.eval(); self.recon_head.eval()
+        mse = nn.MSELoss()
+        total = 0.0
+        n_batches = 0
+        K = len(self.subsets)
+        for (x,) in loader:
+            x = x.to(self.device)
+            xs = [self._get_subset_input(x, s) for s in self.subsets]
+            zs = [self.encoder(xi) for xi in xs]
+            ps = [self.proj_head(zi) for zi in zs]
+            loss_ctr = x.new_zeros(1).squeeze()
+            n_pairs = 0
+            for i in range(K):
+                for j in range(i + 1, K):
+                    loss_ctr = loss_ctr + self._nt_xent(ps[i], ps[j])
+                    n_pairs += 1
+            loss_ctr = loss_ctr / max(n_pairs, 1)
+            loss_rec = x.new_zeros(1).squeeze()
+            for zi, xi in zip(zs, xs):
+                loss_rec = loss_rec + mse(self.recon_head(zi), xi)
+            loss_rec = loss_rec / K
+            total += (loss_ctr + self.config["lambda_rec"] * loss_rec).item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = len(self.encoder.blocks)
@@ -1237,7 +1483,7 @@ class _OfficialTabNetBackend:
     """Wrapper around pytorch_tabnet.pretraining.TabNetPretrainer."""
 
     def __init__(self, input_dim, step_dim, n_steps, gamma,
-                 mask_ratio, epochs, batch_size, lr, seed):
+                 mask_ratio, epochs, batch_size, lr, seed, early_stopping_patience):
         self._cfg = dict(n_steps=n_steps, step_dim=step_dim)
         self._pt  = _TabNetPretrainer(
             n_d=step_dim, n_a=step_dim,
@@ -1249,14 +1495,16 @@ class _OfficialTabNetBackend:
             verbose=0, seed=seed,
         )
         self._meta = dict(mask_ratio=mask_ratio, epochs=epochs,
-                          batch_size=batch_size)
+                          batch_size=batch_size, early_stopping_patience=early_stopping_patience)
 
     def fit(self, X_train: np.ndarray):
         m = self._meta
         self._pt.fit(
             X_train,
             max_epochs=m["epochs"],
-            patience=m["epochs"],
+            patience=(m["early_stopping_patience"]
+                      if m["early_stopping_patience"] is not None and m["early_stopping_patience"] > 0
+                      else m["epochs"]),
             batch_size=m["batch_size"],
             virtual_batch_size=m["batch_size"],
             pretraining_ratio=m["mask_ratio"],
@@ -1330,10 +1578,16 @@ class TabNetModel(BaseSSLModel):
         batch_size: int   = 256,
         lr: float         = 1e-3,
         seed: int         = 42,
+        early_stopping_patience: Optional[int] = 10,
+        early_stopping_min_delta: float = 1e-4,
+        val_split: float = 0.1,
     ):
         arch = self.ARCH_CONFIGS[arch_name]
         config = dict(arch_name=arch_name, mask_ratio=mask_ratio, gamma=gamma,
-                      epochs=epochs, batch_size=batch_size, lr=lr, **arch)
+                      epochs=epochs, batch_size=batch_size, lr=lr,
+                      early_stopping_patience=early_stopping_patience,
+                      early_stopping_min_delta=early_stopping_min_delta,
+                      val_split=val_split, **arch)
         super().__init__(input_dim, config, seed)
         self.arch_name = arch_name
 
@@ -1341,7 +1595,7 @@ class TabNetModel(BaseSSLModel):
             log.info(f"[TabNet-{arch_name}] Using official pytorch-tabnet.")
             self._official = _OfficialTabNetBackend(
                 input_dim, arch["step_dim"], arch["n_steps"], gamma,
-                mask_ratio, epochs, batch_size, lr, seed,
+                mask_ratio, epochs, batch_size, lr, seed, early_stopping_patience,
             )
             self.encoder    = None
             self.recon_head = None
@@ -1363,10 +1617,17 @@ class TabNetModel(BaseSSLModel):
             self._fitted = True
             return
 
-        loader = make_loader(X_train, self.config["batch_size"])
+        X_fit, X_val = split_ssl_train_val(X_train, self.config["val_split"], self.seed)
+        loader = make_loader(X_fit, self.config["batch_size"])
+        val_loader = (make_loader(X_val, self.config["batch_size"], shuffle=False)
+                      if X_val is not None else None)
         params = list(self.encoder.parameters()) + list(self.recon_head.parameters())
         optim  = torch.optim.Adam(params, lr=self.config["lr"])
         p_mask = self.config["mask_ratio"]
+        stopper = EarlyStopper(
+            self.config["early_stopping_patience"],
+            self.config["early_stopping_min_delta"],
+        )
 
         log.info(f"[TabNet-{self.arch_name}] Custom pretraining "
                  f"{self.config['epochs']} epochs ...")
@@ -1383,9 +1644,36 @@ class TabNetModel(BaseSSLModel):
                         else x_hat.new_zeros(1).mean())
                 optim.zero_grad(); loss.backward(); optim.step()
                 total += loss.item()
+            msg = f"  epoch {epoch:3d}/{self.config['epochs']}  train_loss={total/len(loader):.4f}"
+            if val_loader is not None:
+                val_loss = self._evaluate_loss(val_loader)
+                msg += f"  val_loss={val_loss:.4f}"
+                if stopper.update(val_loss, self._get_state):
+                    log.info(msg + "  early_stop=1")
+                    if stopper.best_state is not None:
+                        self._set_state(stopper.best_state)
+                    self._fitted = True
+                    return
             if epoch % max(1, self.config["epochs"] // 5) == 0 or epoch == 1:
-                log.info(f"  epoch {epoch:3d}/{self.config['epochs']}  loss={total/len(loader):.4f}")
+                log.info(msg)
         self._fitted = True
+
+    @torch.no_grad()
+    def _evaluate_loss(self, loader: DataLoader) -> float:
+        self.encoder.eval(); self.recon_head.eval()
+        total = 0.0
+        n_batches = 0
+        for (x,) in loader:
+            x = x.to(self.device)
+            mask = torch.rand_like(x) < self.config["mask_ratio"]
+            x_in = x.masked_fill(mask, 0.0)
+            final, _ = self.encoder(x_in)
+            x_hat = self.recon_head(final)
+            loss = (F.mse_loss(x_hat[mask], x[mask]) if mask.any()
+                    else x_hat.new_zeros(1).mean())
+            total += loss.item()
+            n_batches += 1
+        return total / max(n_batches, 1)
 
     def list_available_layers(self) -> List[str]:
         n = self.config["n_steps"]
@@ -1450,6 +1738,9 @@ def build_ssl_model(
     batch_size: int = 256,
     lr: float       = 1e-3,
     seed: int       = 42,
+    early_stopping_patience: Optional[int] = 10,
+    early_stopping_min_delta: float = 1e-4,
+    val_split: float = 0.1,
 ) -> BaseSSLModel:
     """Factory: instantiate an SSL model by family + architecture name."""
     family_cls = {
@@ -1470,6 +1761,9 @@ def build_ssl_model(
         batch_size=batch_size,
         lr=lr,
         seed=seed,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        val_split=val_split,
     )
 
 

@@ -126,6 +126,9 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--early_stopping_patience", type=int, default=10)
+    p.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
+    p.add_argument("--val_split", type=float, default=0.1)
 
     # Data options
     p.add_argument(
@@ -162,6 +165,9 @@ def main():
     log.info(f"  batch_size  : {args.batch_size}")
     log.info(f"  lr          : {args.lr}")
     log.info(f"  seed        : {args.seed}")
+    log.info(f"  es_patience : {args.early_stopping_patience}")
+    log.info(f"  es_min_delta: {args.early_stopping_min_delta}")
+    log.info(f"  val_split   : {args.val_split}")
     log.info(f"  data_dir    : {args.data_dir}")
     log.info(f"  output_dir  : {args.output_dir}")
     log.info("=" * 70)
@@ -219,6 +225,9 @@ def main():
                 batch_size=args.batch_size,
                 lr=args.lr,
                 seed=args.seed,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_min_delta=args.early_stopping_min_delta,
+                val_split=args.val_split,
                 skip_pretrain=skip_pretrain,
                 skip_extract=skip_extract,
                 skip_probe=skip_probe,
@@ -238,6 +247,9 @@ def main():
             batch_size=args.batch_size,
             lr=args.lr,
             seed=args.seed,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            val_split=args.val_split,
             skip_pretrain=skip_pretrain,
             skip_extract=skip_extract,
             skip_probe=skip_probe,
