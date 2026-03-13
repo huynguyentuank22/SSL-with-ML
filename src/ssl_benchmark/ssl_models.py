@@ -968,9 +968,9 @@ class SubTabModel(BaseSSLModel):
     name = "subtab"
 
     ARCH_CONFIGS = {
-        "subtab_small":  {"hidden_dims": [64],       "latent_dim": 32,  "n_subsets": 3, "overlap": 0.5},
-        "subtab_medium": {"hidden_dims": [128, 64],   "latent_dim": 64,  "n_subsets": 4, "overlap": 0.5},
-        "subtab_large":  {"hidden_dims": [256, 128],  "latent_dim": 64,  "n_subsets": 4, "overlap": 0.5},
+        "subtab_small":  {"hidden_dims": [64],       "latent_dim": 32,  "n_subsets": 3, "overlap": 0.25},
+        "subtab_medium": {"hidden_dims": [128, 64],   "latent_dim": 64,  "n_subsets": 4, "overlap": 0.25},
+        "subtab_large":  {"hidden_dims": [256, 128],  "latent_dim": 64,  "n_subsets": 4, "overlap": 0.25},
     }
 
     def __init__(
