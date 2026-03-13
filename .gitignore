@@ -1,0 +1,12 @@
+tmp/
+__pycache__/
+
+notebooks/*
+!notebooks/prepare_24_splits.ipynb
+
+.env
+catboost_info/
+
+.venv/
+
+data/
