@@ -140,6 +140,7 @@ def run_ssl_architecture(
     y_test_dict:  Dict[str, np.ndarray],
     task_types:  Dict[str, str],
     output_dir:  Path,
+    embeddings_dir: Optional[Path] = None,
     epochs:      int  = 50,
     batch_size:  int  = 256,
     lr:          float = 1e-3,
@@ -159,6 +160,8 @@ def run_ssl_architecture(
     log.info("=" * 70)
     log.info(f"SSL family: {ssl_family}  |  Architecture: {arch_name}")
     log.info("=" * 70)
+
+    embeddings_root = embeddings_dir if embeddings_dir is not None else output_dir
 
     ckpt_path = (output_dir / "checkpoints" /
                  ssl_family / f"{arch_name}.pt")
@@ -204,13 +207,13 @@ def run_ssl_architecture(
     available_layers = model.list_available_layers()
 
     if not skip_extract:
-        saved_layers = save_embeddings(model, X_train, X_test, arch_name, output_dir)
+        saved_layers = save_embeddings(model, X_train, X_test, arch_name, embeddings_root)
     else:
         # Determine which layers are already on disk
         saved_layers = [
             layer for layer in available_layers
-            if _emb_path(output_dir, ssl_family, arch_name, layer, "train").exists()
-            and _emb_path(output_dir, ssl_family, arch_name, layer, "test").exists()
+            if _emb_path(embeddings_root, ssl_family, arch_name, layer, "train").exists()
+            and _emb_path(embeddings_root, ssl_family, arch_name, layer, "test").exists()
         ]
         missing = set(available_layers) - set(saved_layers)
         if missing:
@@ -230,7 +233,7 @@ def run_ssl_architecture(
     if not skip_probe:
         for layer_name in saved_layers:
             # Load this layer's embeddings from disk, probe, then release
-            embs = load_embeddings_from_disk(output_dir, ssl_family, arch_name, layer_name)
+            embs = load_embeddings_from_disk(embeddings_root, ssl_family, arch_name, layer_name)
             if embs is None:
                 log.warning(f"  Skipping layer '{layer_name}' — embeddings missing.")
                 continue
@@ -292,6 +295,7 @@ def run_full_benchmark(
     y_test_dict:   Dict[str, np.ndarray],
     task_types:    Dict[str, str],
     output_dir:    Path,
+    embeddings_dir: Optional[Path] = None,
     epochs:        int   = 50,
     batch_size:    int   = 256,
     lr:            float = 1e-3,
@@ -328,6 +332,7 @@ def run_full_benchmark(
                     y_test_dict=y_test_dict,
                     task_types=task_types,
                     output_dir=output_dir,
+                    embeddings_dir=embeddings_dir,
                     epochs=epochs,
                     batch_size=batch_size,
                     lr=lr,

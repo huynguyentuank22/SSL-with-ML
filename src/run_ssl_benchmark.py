@@ -25,6 +25,7 @@ Usage examples
   python src/run_ssl_benchmark.py --extract_only        # assume checkpoints exist, skip probe
   python src/run_ssl_benchmark.py --probe_only          # assume embeddings exist
   python src/run_ssl_benchmark.py --ssl_model saint --task pclass --probe_only
+    python src/run_ssl_benchmark.py --probe_only --embeddings_dir results/old_run
 
 Training hyper-parameter overrides
 -----------------------------------
@@ -140,6 +141,13 @@ def parse_args():
         help="Root output directory.",
     )
     p.add_argument(
+        "--embeddings_dir", type=Path, default=None,
+        help=(
+            "Directory root used to read/write embeddings. "
+            "Defaults to --output_dir when omitted."
+        ),
+    )
+    p.add_argument(
         "--exclude_cols", nargs="*", default=None,
         help="Extra columns to exclude from features.",
     )
@@ -170,6 +178,7 @@ def main():
     log.info(f"  val_split   : {args.val_split}")
     log.info(f"  data_dir    : {args.data_dir}")
     log.info(f"  output_dir  : {args.output_dir}")
+    log.info(f"  embeddings_dir: {args.embeddings_dir}")
     log.info("=" * 70)
 
     data = load_data(
@@ -197,6 +206,7 @@ def main():
     skip_pretrain = args.probe_only
     skip_extract = args.probe_only
     skip_probe = args.extract_only
+    embeddings_dir = args.embeddings_dir if args.embeddings_dir is not None else args.output_dir
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -221,6 +231,7 @@ def main():
                 y_test_dict=y_test_dict,
                 task_types=task_types,
                 output_dir=args.output_dir,
+                embeddings_dir=embeddings_dir,
                 epochs=args.epochs,
                 batch_size=args.batch_size,
                 lr=args.lr,
@@ -243,6 +254,7 @@ def main():
             y_test_dict=y_test_dict,
             task_types=task_types,
             output_dir=args.output_dir,
+            embeddings_dir=embeddings_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,

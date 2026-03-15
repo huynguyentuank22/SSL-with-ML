@@ -10,3 +10,5 @@ catboost_info/
 .venv/
 
 data/
+
+results/
