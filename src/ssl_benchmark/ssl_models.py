@@ -36,10 +36,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-# import torch
-# import torch.nn as nn
-# import torch.nn.functional as F
-# from torch.utils.data import DataLoader, TensorDataset
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +53,7 @@ try:
 except ImportError:
     _HAS_PYTORCH_TABNET = False
 
-# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DEVICE = "cuda"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ===========================================================================

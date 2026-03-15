@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
-# import torch
+import torch
 
 from .ssl_models import build_ssl_model, get_all_architectures, BaseSSLModel
 from .downstream import run_downstream_probe, build_summary
