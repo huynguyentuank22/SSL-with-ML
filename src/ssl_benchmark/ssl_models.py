@@ -53,7 +53,8 @@ try:
 except ImportError:
     _HAS_PYTORCH_TABNET = False
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = "cuda"
 
 
 # ===========================================================================
