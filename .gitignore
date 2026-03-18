@@ -12,3 +12,5 @@ catboost_info/
 data/
 
 results/
+
+.vscode/
